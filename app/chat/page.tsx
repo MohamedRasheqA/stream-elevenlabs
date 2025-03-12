@@ -27,6 +27,7 @@ interface TTSControlsProps {
   messageContent: string;
   messageId: string;
   isEnabled: boolean;
+  audioChunks: string[];
 }
 
 interface VoiceRecorderProps {
@@ -221,30 +222,67 @@ const VoiceRecorder: React.FC<VoiceRecorderProps> = ({ onTranscription, disabled
     </div>
   );
 };
-
-const TTSControls: React.FC<TTSControlsProps> = ({ messageContent, messageId, isEnabled }) => {
+// This function splits a text into chunks based on natural breakpoints
+// to improve the flow and quality of text-to-speech output
+const chunkResponse = (text: string, chunkSize: number = 200) => {
+  // Split by natural breakpoints (periods followed by space, question marks, exclamation points)
+  const sentences = text.match(/[^.!?]+[.!?]+\s*/g) || [];
+  
+  const chunks: string[] = [];
+  let currentChunk = '';
+  
+  for (const sentence of sentences) {
+    // If adding this sentence would exceed the limit, start a new chunk
+    if ((currentChunk + sentence).length > chunkSize && currentChunk.length > 0) {
+      chunks.push(currentChunk.trim());
+      currentChunk = sentence;
+    } else {
+      currentChunk += sentence;
+    }
+  }
+  
+  // Add the final chunk if there's anything left
+  if (currentChunk.trim()) {
+    chunks.push(currentChunk.trim());
+  }
+  
+  // If we have no chunks (maybe the input had no proper sentences),
+  // fall back to word-based chunking
+  if (chunks.length === 0) {
+    const words = text.split(' ');
+    currentChunk = '';
+    
+    for (const word of words) {
+      if ((currentChunk + ' ' + word).length <= chunkSize || currentChunk.length === 0) {
+        currentChunk += (currentChunk ? ' ' : '') + word;
+      } else {
+        chunks.push(currentChunk);
+        currentChunk = word;
+      }
+    }
+    
+    if (currentChunk) {
+      chunks.push(currentChunk);
+    }
+  }
+  
+  return chunks;
+};
+const TTSControls: React.FC<TTSControlsProps> = ({ messageContent, messageId, isEnabled, audioChunks }) => {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
+  const [currentChunkIndex, setCurrentChunkIndex] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
   
-  const togglePlayback = async () => {
-    if (isLoading || !isEnabled) return;
-    
-    if (isPlaying) {
-      audioRef.current?.pause();
+  const playNextChunk = async (chunkIndex: number) => {
+    if (chunkIndex >= audioChunks.length) {
       setIsPlaying(false);
+      setCurrentChunkIndex(0);
       return;
     }
-    
-    try {
-      setIsLoading(true);
-      setError(null);
-      
-      // Remove ** and # symbols from messageContent
-      const sanitizedMessageContent = messageContent.replace(/[\*\#]/g, '');
 
-      // Call ElevenLabs API directly
+    try {
       const response = await fetch('https://api.elevenlabs.io/v1/text-to-speech/qLhgJ67YB77mwXXmI6XF/stream', {
         method: 'POST',
         headers: {
@@ -252,7 +290,7 @@ const TTSControls: React.FC<TTSControlsProps> = ({ messageContent, messageId, is
           'xi-api-key': 'sk_92abd11707faa16905cdcba5849819cd5b380993a19c10fc',
         },
         body: JSON.stringify({
-          text: sanitizedMessageContent, // Use sanitized message content
+          text: audioChunks[chunkIndex],
           model_id: 'eleven_monolingual_v1',
           voice_settings: {
             stability: 0.5,
@@ -260,22 +298,54 @@ const TTSControls: React.FC<TTSControlsProps> = ({ messageContent, messageId, is
           }
         }),
       });
-      
+
       if (!response.ok) {
         throw new Error('Failed to generate audio');
       }
-      
+
       const audioBlob = await response.blob();
       const audioUrl = URL.createObjectURL(audioBlob);
       
       if (audioRef.current) {
         audioRef.current.src = audioUrl;
-        audioRef.current.play();
-        setIsPlaying(true);
+        audioRef.current.onended = () => {
+          URL.revokeObjectURL(audioUrl);
+          setCurrentChunkIndex(chunkIndex + 1);
+          playNextChunk(chunkIndex + 1);
+        };
+        await audioRef.current.play();
       }
     } catch (err) {
       console.error('TTS Error:', err);
       setError(err instanceof Error ? err.message : 'Failed to play audio');
+      setIsPlaying(false);
+    }
+  };
+  
+  const togglePlayback = async () => {
+    if (isLoading || !isEnabled) return;
+
+    if (isPlaying) {
+      if (audioRef.current) {
+        audioRef.current.pause();
+        if (audioRef.current.src) {
+          URL.revokeObjectURL(audioRef.current.src);
+        }
+      }
+      setIsPlaying(false);
+      setCurrentChunkIndex(0);
+      return;
+    }
+
+    try {
+      setIsLoading(true);
+      setError(null);
+      setIsPlaying(true);
+      await playNextChunk(0);
+    } catch (err) {
+      console.error('TTS Error:', err);
+      setError(err instanceof Error ? err.message : 'Failed to play audio');
+      setIsPlaying(false);
     } finally {
       setIsLoading(false);
     }
@@ -285,7 +355,9 @@ const TTSControls: React.FC<TTSControlsProps> = ({ messageContent, messageId, is
     return () => {
       if (audioRef.current) {
         audioRef.current.pause();
-        URL.revokeObjectURL(audioRef.current.src);
+        if (audioRef.current.src) {
+          URL.revokeObjectURL(audioRef.current.src);
+        }
       }
     };
   }, []);
@@ -326,7 +398,6 @@ const TTSControls: React.FC<TTSControlsProps> = ({ messageContent, messageId, is
       
       <audio
         ref={audioRef}
-        onEnded={() => setIsPlaying(false)}
         onError={() => {
           setError('Audio playback failed');
           setIsPlaying(false);
@@ -504,6 +575,7 @@ export default function ChatPage() {
   const [isScoreRubricOpen, setIsScoreRubricOpen] = useState(false);
   const [hasPlayedIntro, setHasPlayedIntro] = useState(false);
   const introAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [audioChunks, setAudioChunks] = useState<string[]>([]);
 
   const { systemPrompt, heading, description, pageTitle } = useSystemPrompt();
 
@@ -525,6 +597,17 @@ export default function ChatPage() {
       
       setCurrentQuestion(currentInputValue);
       setCurrentResponse(message.content);
+      
+      // Log the entire response before chunking
+      console.log('Full response:', message.content);
+      
+      // Chunk the response and store it
+      const chunks = chunkResponse(message.content, 200); // Adjust chunk size as needed
+      
+      // Log the chunks to verify
+      console.log('Chunks:', chunks);
+      
+      setAudioChunks(chunks);
       
       await logUserQuestion(currentInputValue, message.content);
     },
@@ -784,6 +867,7 @@ export default function ChatPage() {
                           messageContent={m.content} 
                           messageId={m.id} 
                           isEnabled={isTTSEnabled}
+                          audioChunks={audioChunks}
                         />
                       </div>
                     )}
